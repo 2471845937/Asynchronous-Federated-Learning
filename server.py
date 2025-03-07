@@ -29,12 +29,17 @@ class FederatedServer:
         self.pending_clients = []
         self.lock = threading.Lock()
 
-    def aggregate(self, client_params, weights):
+    def aggregate(self, client_params, alpha):
+        """使用加权平均更新全局模型"""
         global_dict = self.model.state_dict()
         for key in global_dict:
-            client_tensors = [param[key].float() for param in client_params]
-            weighted_tensors = [tensor * weight for tensor, weight in zip(client_tensors, weights)]
-            global_dict[key] = sum(weighted_tensors)
+            # 确保张量在正确的设备上并进行类型转换
+            global_tensor = global_dict[key].float().to(self.device)
+            client_tensor = client_params[key].float().to(self.device)
+
+            # 执行加权平均
+            global_dict[key] = (1 - alpha) * global_tensor + alpha * client_tensor
+
         self.model.load_state_dict(global_dict)
 
     def handle_client(self, client_socket, addr):
@@ -55,18 +60,21 @@ class FederatedServer:
                     data += packet
 
                 update = pickle.loads(data)
-                self.client_sample_counts[addr] = update['sample_count']
 
-                # 计算权重并聚合
-                sample_counts = list(self.client_sample_counts.values())
-                total_samples = sum(sample_counts)
-                weights = [count / total_samples for count in sample_counts]
+                # 更新客户端样本计数（关键修改点）
+                with self.lock:
+                    self.client_sample_counts[addr] = update['sample_count']
+
+                # 计算聚合权重（关键修改点）
+                with self.lock:
+                    total_samples = sum(self.client_sample_counts.values())
+                    if total_samples == 0:
+                        alpha = 0.0
+                    else:
+                        alpha = self.client_sample_counts[addr] / total_samples
 
                 # 聚合参数
-                self.aggregate(
-                    [update['params'] for update in [update]],
-                    weights
-                )
+                self.aggregate(update['params'], alpha)
 
                 # 记录训练指标
                 avg_loss = update['loss']
@@ -96,6 +104,7 @@ class FederatedServer:
                 with self.lock:
                     if addr in self.client_sockets:
                         del self.client_sockets[addr]
+                    if addr in self.client_sample_counts:
                         del self.client_sample_counts[addr]
                 break
 
@@ -105,7 +114,7 @@ class FederatedServer:
     def run(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind(('192.168.1.203', 12345))
+        server_socket.bind(('192.168.1.206', 12345))
         server_socket.listen(5)
 
         # 客户端接受线程
@@ -133,23 +142,25 @@ class FederatedServer:
                     new_clients = self.pending_clients.copy()
                     self.pending_clients.clear()
 
-                # 自动分配任务给新客户端
+                # 初始化新客户端（关键修改点）
                 for client_socket, addr in new_clients:
-                    self.client_sockets[addr] = client_socket
-                    self.client_sample_counts[addr] = 0
+                    with self.lock:
+                        self.client_sockets[addr] = client_socket
+                        # 初始化样本数为0，直到收到第一次更新
+                        self.client_sample_counts[addr] = 0
                     print(f"Client {addr} added to training pool.")
                     threading.Thread(target=self.handle_client, args=(client_socket, addr), daemon=True).start()
 
-                # 如果有客户端，开始训练
+                # 发送训练指令给所有客户端
                 if self.client_sockets:
                     print(f"\nStarting Global Round {self.global_round} with {len(self.client_sockets)} clients.")
 
-                    # 发送训练指令和全局模型
+                    # 准备全局模型参数
                     model_data = pickle.dumps(self.model.state_dict())
                     model_size = len(model_data)
                     disconnected = []
 
-                    # 发送训练指令和模型
+                    # 发送给所有客户端
                     for addr in list(self.client_sockets.keys()):
                         sock = self.client_sockets[addr]
                         try:
@@ -160,16 +171,17 @@ class FederatedServer:
                             print(f"Error sending to {addr}: {e}")
                             disconnected.append(addr)
 
-                    # 移除断开连接的客户端
-                    for addr in disconnected:
-                        del self.client_sockets[addr]
-                        del self.client_sample_counts[addr]
+                    # 清理断开连接的客户端
+                    with self.lock:
+                        for addr in disconnected:
+                            if addr in self.client_sockets:
+                                del self.client_sockets[addr]
+                            if addr in self.client_sample_counts:
+                                del self.client_sample_counts[addr]
                     if disconnected:
                         print(f"Removed disconnected clients: {disconnected}")
 
-                else:
-                    print("No clients in training pool. Waiting...")
-                    time.sleep(5)
+                time.sleep(5)  # 控制轮次频率
 
         except KeyboardInterrupt:
             print("\nShutting down server...")
