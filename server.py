@@ -6,6 +6,7 @@ import time
 import matplotlib.pyplot as plt
 from model import create_model, test
 from data_loader import get_datasets
+import queue
 
 
 class FederatedServer:
@@ -28,6 +29,7 @@ class FederatedServer:
         self.client_sample_counts = {}
         self.pending_clients = []
         self.lock = threading.Lock()
+        self.update_queue = queue.Queue()  # 线程安全的队列用于存储客户端更新
 
     def aggregate(self, client_params, alpha):
         """使用加权平均更新全局模型"""
@@ -61,11 +63,33 @@ class FederatedServer:
 
                 update = pickle.loads(data)
 
-                # 更新客户端样本计数（关键修改点）
+                # 将更新放入队列
                 with self.lock:
                     self.client_sample_counts[addr] = update['sample_count']
+                self.update_queue.put((update['params'], addr))
 
-                # 计算聚合权重（关键修改点）
+                print(f"Received update from {addr}")
+
+            except Exception as e:
+                print(f"Error receiving from {addr}: {e}")
+                with self.lock:
+                    if addr in self.client_sockets:
+                        del self.client_sockets[addr]
+                    if addr in self.client_sample_counts:
+                        del self.client_sample_counts[addr]
+                break
+
+        client_socket.close()
+        print(f"Client {addr} disconnected.")
+
+    def async_aggregation(self):
+        """异步聚合客户端更新"""
+        while True:
+            try:
+                # 从队列中获取客户端更新
+                client_params, addr = self.update_queue.get()
+
+                # 计算聚合权重
                 with self.lock:
                     total_samples = sum(self.client_sample_counts.values())
                     if total_samples == 0:
@@ -74,13 +98,14 @@ class FederatedServer:
                         alpha = self.client_sample_counts[addr] / total_samples
 
                 # 聚合参数
-                self.aggregate(update['params'], alpha)
+                self.aggregate(client_params, alpha)
 
                 # 记录训练指标
-                avg_loss = update['loss']
-                avg_acc = update['accuracy']
-                self.train_losses.append(avg_loss)
-                self.train_accuracies.append(avg_acc)
+                with self.lock:
+                    avg_loss = client_params.get('loss', 0.0)
+                    avg_acc = client_params.get('accuracy', 0.0)
+                    self.train_losses.append(avg_loss)
+                    self.train_accuracies.append(avg_acc)
 
                 # 测试全局模型
                 test_loss, test_acc = test(self.model, self.test_loader, self.device)
@@ -100,22 +125,17 @@ class FederatedServer:
                 self.global_round += 1
 
             except Exception as e:
-                print(f"Error receiving from {addr}: {e}")
-                with self.lock:
-                    if addr in self.client_sockets:
-                        del self.client_sockets[addr]
-                    if addr in self.client_sample_counts:
-                        del self.client_sample_counts[addr]
-                break
-
-        client_socket.close()
-        print(f"Client {addr} disconnected.")
+                print(f"Error during aggregation: {e}")
 
     def run(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind(('192.168.1.206', 12345))
         server_socket.listen(5)
+
+        # 启动异步聚合线程
+        aggregation_thread = threading.Thread(target=self.async_aggregation, daemon=True)
+        aggregation_thread.start()
 
         # 客户端接受线程
         def accept_clients():
@@ -142,7 +162,7 @@ class FederatedServer:
                     new_clients = self.pending_clients.copy()
                     self.pending_clients.clear()
 
-                # 初始化新客户端（关键修改点）
+                # 初始化新客户端
                 for client_socket, addr in new_clients:
                     with self.lock:
                         self.client_sockets[addr] = client_socket
@@ -151,35 +171,16 @@ class FederatedServer:
                     print(f"Client {addr} added to training pool.")
                     threading.Thread(target=self.handle_client, args=(client_socket, addr), daemon=True).start()
 
-                # 发送训练指令给所有客户端
-                if self.client_sockets:
-                    print(f"\nStarting Global Round {self.global_round} with {len(self.client_sockets)} clients.")
-
-                    # 准备全局模型参数
-                    model_data = pickle.dumps(self.model.state_dict())
-                    model_size = len(model_data)
-                    disconnected = []
-
-                    # 发送给所有客户端
-                    for addr in list(self.client_sockets.keys()):
-                        sock = self.client_sockets[addr]
-                        try:
-                            sock.sendall(b'TRAIN')
-                            sock.sendall(model_size.to_bytes(4, 'big'))
-                            sock.sendall(model_data)
-                        except Exception as e:
-                            print(f"Error sending to {addr}: {e}")
-                            disconnected.append(addr)
-
-                    # 清理断开连接的客户端
-                    with self.lock:
-                        for addr in disconnected:
-                            if addr in self.client_sockets:
-                                del self.client_sockets[addr]
-                            if addr in self.client_sample_counts:
-                                del self.client_sample_counts[addr]
-                    if disconnected:
-                        print(f"Removed disconnected clients: {disconnected}")
+                    # 立即发送训练指令
+                    try:
+                        model_data = pickle.dumps(self.model.state_dict())
+                        model_size = len(model_data)
+                        client_socket.sendall(b'TRAIN')
+                        client_socket.sendall(model_size.to_bytes(4, 'big'))
+                        client_socket.sendall(model_data)
+                        print(f"Sent training instruction to {addr}")
+                    except Exception as e:
+                        print(f"Error sending training instruction to {addr}: {e}")
 
                 time.sleep(5)  # 控制轮次频率
 
